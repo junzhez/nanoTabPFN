@@ -193,3 +193,49 @@ class NanoTabPFNClassifier():
     def predict(self, X_test: np.array) -> np.array:
         predicted_probabilities = self.predict_proba(X_test)
         return predicted_probabilities.argmax(axis=1)
+
+
+class NanoTabPFNRegressor():
+    """scikit-learn-like regression wrapper that decodes Riemann-distribution logits.
+
+    Parallels NanoTabPFNClassifier but for continuous targets: instead of softmax
+    over class logits, the head's K outputs are interpreted as logits of a
+    Riemann distribution (paper Sec. 4 of arxiv 2112.10510).
+    """
+
+    def __init__(self, model: NanoTabPFNModel, riemann, device: torch.device):
+        self.model = model.to(device)
+        self.device = device
+        self.riemann = riemann.to(device)
+
+    def fit(self, X_train: np.array, y_train: np.array):
+        self.X_train = np.asarray(X_train, dtype=np.float32)
+        self.y_train = np.asarray(y_train, dtype=np.float32)
+
+    def _logits(self, X_test: np.array) -> torch.Tensor:
+        X_test = np.asarray(X_test, dtype=np.float32)
+        x = np.concatenate((self.X_train, X_test))
+        with torch.no_grad():
+            x_t = torch.from_numpy(x).unsqueeze(0).to(self.device)
+            y_t = torch.from_numpy(self.y_train).unsqueeze(0).to(self.device)
+            out = self.model((x_t, y_t), train_test_split_index=len(self.X_train)).squeeze(0)
+            return out  # (N_test, K) raw logits
+
+    def predict_distribution(self, X_test: np.array) -> np.array:
+        """Returns softmax PMF over Riemann buckets, shape (N_test, K)."""
+        logits = self._logits(X_test)
+        return F.softmax(logits, dim=-1).to("cpu").numpy()
+
+    def predict_density(self, X_test: np.array, y_grid: np.array) -> np.array:
+        """Returns density at each y in y_grid for each test x, shape (N_test, len(y_grid))."""
+        logits = self._logits(X_test)
+        y_grid_t = torch.as_tensor(y_grid, dtype=torch.float32, device=self.device)
+        return self.riemann.predict_density(logits, y_grid_t).to("cpu").numpy()
+
+    def predict_mean_and_ci(self, X_test: np.array, alpha: float = 0.05):
+        """Returns (mean, lo, hi) as numpy arrays of shape (N_test,) each."""
+        logits = self._logits(X_test)
+        mean = self.riemann.mean(logits)
+        lo = self.riemann.quantile(logits, alpha / 2)
+        hi = self.riemann.quantile(logits, 1 - alpha / 2)
+        return mean.to("cpu").numpy(), lo.to("cpu").numpy(), hi.to("cpu").numpy()

@@ -5,7 +5,7 @@ import h5py
 import numpy as np
 import schedulefree
 import torch
-from model import NanoTabPFNClassifier, NanoTabPFNModel
+from model import NanoTabPFNClassifier, NanoTabPFNModel, NanoTabPFNRegressor
 from sklearn.datasets import *
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -48,7 +48,8 @@ def eval(classifier):
     return scores
 
 def train(model: NanoTabPFNModel, prior: DataLoader,
-          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None):
+          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None,
+          loss_mode: str = "classification", riemann=None):
     """
     Trains our model on the given prior using the given criterion.
 
@@ -58,14 +59,22 @@ def train(model: NanoTabPFNModel, prior: DataLoader,
         lr: (float) learning rate
         device: (torch.device) the device we are using
         steps_per_eval: (int) how many steps we wait before running evaluation again
-        eval_func: a function that takes in a classifier and returns a dict containing the average scores
-                   for some metrics and datasets
+        eval_func: a function that takes in a classifier (or regressor) and returns a dict containing
+                   the average scores for some metrics and datasets
+        loss_mode: "classification" (default) or "regression". In regression mode, continuous y is
+                   bucketized into the provided RiemannDistribution and CE is computed on bucket indices.
+        riemann: required when loss_mode="regression". A RiemannDistribution used to bucketize targets
+                 and to instantiate NanoTabPFNRegressor for evaluation.
 
     Returns:
         (model) our trained numpy model
         (list) a list containing our eval history, each entry is the real time used for training so far together
                with a dict mapping metric names to their average values accross a list of datasets
     """
+    if loss_mode not in ("classification", "regression"):
+        raise ValueError(f"loss_mode must be 'classification' or 'regression', got {loss_mode!r}")
+    if loss_mode == "regression" and riemann is None:
+        raise ValueError("loss_mode='regression' requires riemann=...")
     if not device:
         device = get_default_device()
     model.to(device)
@@ -90,7 +99,11 @@ def train(model: NanoTabPFNModel, prior: DataLoader,
             output = model(data, train_test_split_index=train_test_split_index)
             targets = targets[:, train_test_split_index:]
 
-            targets = targets.reshape((-1,)).to(torch.long)
+            targets = targets.reshape((-1,))
+            if loss_mode == "regression":
+                targets = riemann.bucketize(targets)
+            else:
+                targets = targets.to(torch.long)
             output = output.view(-1, output.shape[-1])
 
             loss = criterion(output, targets).mean()
@@ -108,8 +121,11 @@ def train(model: NanoTabPFNModel, prior: DataLoader,
                 model.eval()
                 optimizer.eval()
 
-                classifier = NanoTabPFNClassifier(model, device)
-                scores = eval_func(classifier)
+                if loss_mode == "regression":
+                    wrapper = NanoTabPFNRegressor(model, riemann, device)
+                else:
+                    wrapper = NanoTabPFNClassifier(model, device)
+                scores = eval_func(wrapper)
                 eval_history.append((train_time, scores))
                 score_str = " | ".join([f"{k} {v:7.4f}" for k,v in scores.items()])
                 print(f"time {train_time:7.1f}s | loss {total_loss:7.4f} | {score_str}")
